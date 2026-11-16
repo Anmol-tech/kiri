@@ -866,6 +866,11 @@ t unpriv-port-host-net "1024" $D run --rm --network host alpine cat /proc/sys/ne
 t seccomp-on "Seccomp:	2" $D run --rm alpine grep Seccomp: /proc/self/status
 t seccomp-userns "not permitted" $D run --rm alpine unshare -U true
 t seccomp-keyctl "not permitted" bash -c "$D run --rm alpine sh -c 'apk add -q keyutils >/dev/null 2>&1; keyctl show 2>&1'"
+# ntp_adjtime() with modes 0 only reads the clock's state, as on Docker (#327);
+# a change (ADJ_MAXERROR) still needs CAP_SYS_TIME. glibc, not musl: musl
+# makes it the adjtimex syscall, glibc clock_adjtime, which the filter denied.
+t seccomp-adjtimex-read "adjtimex ok" $D run --rm python:3.13-slim python -c 'import ctypes,os; l=ctypes.CDLL(None,use_errno=True); b=ctypes.create_string_buffer(256); print("adjtimex", "ok" if l.adjtimex(b) >= 0 else os.strerror(ctypes.get_errno()))'
+t seccomp-adjtimex-set "Operation not permitted" $D run --rm python:3.13-slim python -c 'import ctypes,os; l=ctypes.CDLL(None,use_errno=True); b=ctypes.create_string_buffer(256); ctypes.c_uint.from_buffer(b).value=4; print("adjtimex", "ok" if l.adjtimex(b) >= 0 else os.strerror(ctypes.get_errno()))'
 t seccomp-unconfined "userns-ok" $D run --rm --security-opt seccomp=unconfined alpine unshare -U echo userns-ok
 t seccomp-privileged-boundary "Seccomp:	2" $D run --rm --privileged alpine grep Seccomp: /proc/self/status
 t vsock-unconfined "Address family not supported" $D run --rm --security-opt seccomp=unconfined python:3.13-alpine python -c 'import socket; socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)'
