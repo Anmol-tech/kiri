@@ -927,6 +927,15 @@ t connect-into-gap-addresses "2" bash -c "$D exec gaps ip -4 -o addr | grep -c '
 t disconnect-all-in-any-order "ok" bash -c "$D network disconnect nc2 gaps && $D network disconnect nc3 gaps && echo ok"
 $D rm -f gaps >/dev/null
 t network-rm-after-disconnects "all removed" bash -c "$D network rm nc1 nc2 nc3 >/dev/null 2>&1; [ -z \"\$($D network ls -q --filter name=nc1 --filter name=nc2 --filter name=nc3)\" ] && echo all removed"
+# A container on the default bridge that joins a user network resolves that
+# network's names, running or not yet started (k3d's load balancer), as on
+# Docker (#449).
+$D network create ndr >/dev/null; $D run -d --name ndr-srv --network ndr alpine sleep 300 >/dev/null
+t connect-running-resolv "127.0.0.11" bash -c "$D run -d --name ndr-a alpine sleep 300 >/dev/null && $D network connect ndr ndr-a && $D exec ndr-a cat /etc/resolv.conf"
+t connect-running-dns "Name:" $D exec ndr-a nslookup ndr-srv
+t connect-before-start-dns "Name:" bash -c "$D create --name ndr-c alpine sh -c 'nslookup ndr-srv; sleep 300' >/dev/null && $D network connect ndr ndr-c && $D start ndr-c >/dev/null && sleep 1 && $D logs ndr-c"
+t connect-dns-internet "Address" $D exec ndr-a nslookup example.com
+$D rm -f ndr-srv ndr-a ndr-c >/dev/null; $D network rm ndr >/dev/null
 
 section "events, prune, system df, search"
 t events "start" bash -c "($D events --filter container=evt --format '{{.Action}}' & p=\$!; sleep 0.5; $D run --name evt alpine true >/dev/null; sleep 0.5; kill \$p) 2>/dev/null"

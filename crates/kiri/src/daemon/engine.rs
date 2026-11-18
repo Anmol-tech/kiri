@@ -2463,6 +2463,19 @@ impl Engine {
                     dns_names.push(name);
                     dns_names.extend(spec.aliases.iter().cloned());
                     dns_names.push(hostname.clone());
+                } else {
+                    // On the default bridge and connected to a user network
+                    // before it started (k3d's load balancer): its other
+                    // networks are plugged in only once it runs, so the
+                    // embedded DNS is its resolver from the start, and answers
+                    // their names from the start, as on Docker, not after the
+                    // program has looked them up (#449). Its own name is not
+                    // registered on the bridge.
+                    let user = self.user_network_bridges(&spec);
+                    if !user.is_empty() {
+                        flags |= run_flags::DNS_GATEWAY;
+                        net6_opts.extend(user.iter().map(|b| format!("{}={b}", kiri_proto::net_opts::DNS_BRIDGE)));
+                    }
                 }
                 (n.bridge.clone(), ip, n.prefix, n.gateway)
             }
@@ -2676,6 +2689,13 @@ impl Engine {
         attrs.insert("name".into(), net.name.clone().into());
         attrs.insert("type".into(), net.driver.clone().into());
         self.emit("network", action, &net.id, attrs, None);
+    }
+
+    /// The guest bridges of the container's other networks that are
+    /// user-defined, whose names its embedded DNS resolves.
+    fn user_network_bridges(&self, spec: &Spec) -> Vec<String> {
+        let nets = self.lock_networks();
+        spec.extra_networks.iter().filter_map(|x| nets.find(&x.name).filter(|n| n.driver == "bridge" && !n.builtin() && !n.bridge.is_empty()).map(|n| n.bridge.clone())).collect()
     }
 
     /// Fixed addresses containers not running ask for on a network: an
