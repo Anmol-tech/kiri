@@ -26,24 +26,30 @@ const MEMORY_HEADROOM: u64 = 256 << 20;
 const MEMORY_FLOOR: u64 = 256 << 20;
 /// How much more the guest gets at once when it reports pressure.
 const MEMORY_GROW: u64 = 1 << 30;
+const MEMORY_SHRINK_STEP: u64 = 256 << 20;
+const MEMORY_DEADBAND: u64 = 64 << 20;
 
 /// The balloon's next target, in bytes, or None to leave it.
 ///
 /// The guest keeps `MEMORY_HEADROOM` of usable memory (`MemAvailable`) beyond
 /// everything Linux cannot hand out: the boot-time kernel reserve (`ceiling`
 /// less `MemTotal`, mostly `struct page`), zone reclaim watermarks and
-/// `lowmem_reserve`, uncharged kernel memory, container memory and the active
-/// file cache Linux excludes from `MemAvailable`. On an 8 GiB VM the boot
-/// reserve alone is ~173 MiB, and on a 24 GiB VM zone watermarks,
-/// `lowmem_reserve` and uncharged kernel memory add another ~265 MiB — enough
-/// to leave `MemAvailable` at zero even when idle if only `used` and the boot
-/// reserve are counted (#509).
+/// `lowmem_reserve`, uncharged kernel memory, container memory and the share
+/// of page cache Linux excludes from `MemAvailable` (up to `wmark_low`). On
+/// an 8 GiB VM the boot reserve alone is ~173 MiB, and on a 24 GiB VM zone
+/// watermarks, `lowmem_reserve` and uncharged kernel memory add another
+/// ~265 MiB — enough to leave `MemAvailable` at zero even when idle if only
+/// `used` and the boot reserve are counted (#509).
 ///
 /// When the guest reports its live balloon size (`balloon`), `ceiling` less
 /// `balloon + mem_available` is that exact non-available total, independent
-/// of inflation or deflation lag. Without it (an older agent or a kernel that
-/// reports no balloon size), fall back to `used + (ceiling - mem_total)`.
-/// Shrinks in steps, so the guest's caches go gradually, and grows at once.
+/// of inflation or deflation lag while `mem_available` stays above zero.
+/// Whenever `mem_available` is below `MEMORY_HEADROOM` (such as right after
+/// `grow_memory()`, before the balloon finishes deflating, or with an older
+/// agent that reports no balloon size), `target` is never shrunk. Without a
+/// balloon reading, fall back to `used + (ceiling - mem_total)` and never
+/// shrink past `MEMORY_HEADROOM` of `mem_available`. Shrinks in steps, so the
+/// guest's caches go gradually, and grows at once.
 fn next_memory_target(
     used: u64,
     mem_total: u64,
@@ -58,9 +64,19 @@ fn next_memory_target(
         Some(b) if mem_total > 0 => ceiling.saturating_sub(b.saturating_add(mem_available)).max(floor_need),
         _ => floor_need,
     };
-    let want = need.saturating_add(MEMORY_HEADROOM).clamp(MEMORY_FLOOR, ceiling);
-    let next = if want < target { want.max(target.saturating_sub(256 << 20)) } else { want };
-    (next.abs_diff(target) >= 64 << 20).then_some(next)
+    let want = need.saturating_add(MEMORY_HEADROOM).clamp(MEMORY_FLOOR.min(ceiling), ceiling);
+    let want = if mem_total > 0 {
+        let min_target = match balloon {
+            Some(_) if mem_available < MEMORY_HEADROOM => target.min(ceiling),
+            Some(_) => 0,
+            None => target.min(ceiling).saturating_sub(mem_available.saturating_sub(MEMORY_HEADROOM)),
+        };
+        want.max(min_target)
+    } else {
+        want
+    };
+    let next = if want < target { want.max(target.saturating_sub(MEMORY_SHRINK_STEP)) } else { want };
+    (next.abs_diff(target) >= MEMORY_DEADBAND).then_some(next)
 }
 
 /// What a request that needs the VM gets while Kiri is stopped (Stop in
@@ -4989,7 +5005,7 @@ mod name_in_use_tests {
 
 #[cfg(test)]
 mod memory_target_tests {
-    use super::{next_memory_target, MEMORY_FLOOR, MEMORY_HEADROOM};
+    use super::{next_memory_target, MEMORY_FLOOR, MEMORY_GROW, MEMORY_HEADROOM};
 
     const MIB: u64 = 1 << 20;
     const GIB: u64 = 1 << 30;
@@ -5002,10 +5018,14 @@ mod memory_target_tests {
     /// Runs the balloon loop from `target` until it stops moving (older agent
     /// without a balloon reading).
     fn settle(used: u64, mem_total: u64, mut target: u64) -> u64 {
-        while let Some(next) = next_memory_target(used, mem_total, 0, None, CEILING, target) {
+        loop {
+            let balloon = CEILING.saturating_sub(target);
+            let mem_available = mem_total.saturating_sub(balloon).saturating_sub(used);
+            let Some(next) = next_memory_target(used, mem_total, mem_available, None, CEILING, target) else {
+                return target;
+            };
             target = next;
         }
-        target
     }
 
     /// Runs the balloon loop against a simulated guest where `unavailable`
@@ -5033,7 +5053,7 @@ mod memory_target_tests {
         assert!(reserved > 150 * MIB, "an 8 GiB guest's kernel keeps about 173 MiB");
         assert_eq!(target, USED + reserved + MEMORY_HEADROOM);
         // Settled: nothing left to move.
-        assert_eq!(next_memory_target(USED, MEM_TOTAL, 0, None, CEILING, target), None);
+        assert_eq!(next_memory_target(USED, MEM_TOTAL, MEMORY_HEADROOM, None, CEILING, target), None);
     }
 
     /// On a larger VM (24 GiB), zone watermarks, lowmem_reserve (~153 MiB)
@@ -5056,10 +5076,10 @@ mod memory_target_tests {
         assert_eq!(next_memory_target(used, mem_total, mem_available, Some(balloon), ceiling, target), None);
     }
 
-    /// When the guest's balloon lags behind `ceiling - target` (during shrink
-    /// or right after a pressure growth), MemAvailable is correspondingly
-    /// higher or lower, so `balloon + mem_available` stays constant and the
-    /// next target does not overshoot or oscillate.
+    /// When the guest's balloon lags behind `ceiling - target` while
+    /// `MemAvailable` stays above headroom (during shrink or non-clamped
+    /// deflation), `balloon + mem_available` stays constant and the next
+    /// target does not overshoot or oscillate.
     #[test]
     fn target_is_invariant_to_balloon_lag() {
         let ceiling = 24 * GIB;
@@ -5068,12 +5088,13 @@ mod memory_target_tests {
         let target = 2 * GIB;
         let caught_up_balloon = ceiling - target;
         let caught_up_avail = mem_total - caught_up_balloon - unavailable;
-        let lagged_balloon = caught_up_balloon - 180 * MIB;
-        let lagged_avail = mem_total - lagged_balloon - unavailable;
-        assert_eq!(
-            next_memory_target(100 * MIB, mem_total, caught_up_avail, Some(caught_up_balloon), ceiling, target),
-            next_memory_target(100 * MIB, mem_total, lagged_avail, Some(lagged_balloon), ceiling, target),
-        );
+        let shrink_lag_balloon = caught_up_balloon - 180 * MIB;
+        let shrink_lag_avail = mem_total - shrink_lag_balloon - unavailable;
+        let deflate_lag_balloon = caught_up_balloon + 180 * MIB;
+        let deflate_lag_avail = mem_total - deflate_lag_balloon - unavailable;
+        let expected = next_memory_target(100 * MIB, mem_total, caught_up_avail, Some(caught_up_balloon), ceiling, target);
+        assert_eq!(expected, next_memory_target(100 * MIB, mem_total, shrink_lag_avail, Some(shrink_lag_balloon), ceiling, target));
+        assert_eq!(expected, next_memory_target(100 * MIB, mem_total, deflate_lag_avail, Some(deflate_lag_balloon), ceiling, target));
     }
 
     /// Cold page cache is counted in MemAvailable by Linux, so the balloon
@@ -5107,7 +5128,7 @@ mod memory_target_tests {
 
     #[test]
     fn it_shrinks_in_steps_and_grows_at_once() {
-        assert_eq!(next_memory_target(USED, MEM_TOTAL, 0, None, CEILING, CEILING), Some(CEILING - 256 * MIB));
+        assert_eq!(next_memory_target(USED, MEM_TOTAL, MEM_TOTAL - USED, None, CEILING, CEILING), Some(CEILING - 256 * MIB));
         let target = settle(USED, MEM_TOTAL, CEILING);
         let more = USED + GIB;
         assert_eq!(next_memory_target(more, MEM_TOTAL, 0, None, CEILING, target), Some(more + (CEILING - MEM_TOTAL) + MEMORY_HEADROOM));
@@ -5116,7 +5137,7 @@ mod memory_target_tests {
     #[test]
     fn small_changes_leave_it_alone() {
         let target = settle(USED, MEM_TOTAL, CEILING);
-        assert_eq!(next_memory_target(USED + 32 * MIB, MEM_TOTAL, 0, None, CEILING, target), None);
+        assert_eq!(next_memory_target(USED + 32 * MIB, MEM_TOTAL, MEMORY_HEADROOM - 32 * MIB, None, CEILING, target), None);
     }
 
     /// No MemTotal (an agent that sent none): no reserve to add.
@@ -5130,6 +5151,69 @@ mod memory_target_tests {
         assert_eq!(settle(0, CEILING, CEILING), MEMORY_FLOOR);
         assert_eq!(settle(CEILING, MEM_TOTAL, CEILING / 2), CEILING);
         assert_eq!(next_memory_target(u64::MAX, u64::MAX, u64::MAX, Some(u64::MAX), CEILING, CEILING / 2), Some(CEILING));
+    }
+
+    /// Right after a pressure growth (`MEMORY_GROW`), the balloon is still
+    /// deflating (`balloon > ceiling - target`) while `MemAvailable` is clamped
+    /// at zero (or still below headroom). The poll loop must hold `target`
+    /// steady instead of shrinking it back down and fighting the deflation.
+    #[test]
+    fn deflation_lag_after_growth_does_not_shrink_target() {
+        let ceiling = 24 * GIB;
+        let mem_total = 24_656_160 * 1024;
+        let old_target = GIB;
+        let target = old_target + MEMORY_GROW;
+        let unstarted_balloon = ceiling - old_target;
+        assert_eq!(next_memory_target(200 * MIB, mem_total, 0, Some(unstarted_balloon), ceiling, target), None);
+        // Partial deflation that has not yet restored MEMORY_HEADROOM still holds.
+        let partial_balloon = unstarted_balloon - 128 * MIB;
+        assert_eq!(next_memory_target(200 * MIB, mem_total, 64 * MIB, Some(partial_balloon), ceiling, target), None);
+        // Real demand beyond `target` can still grow immediately.
+        assert!(next_memory_target(2 * GIB, mem_total, 0, Some(unstarted_balloon), ceiling, target).is_some_and(|n| n > target));
+        // Once deflation restores ample MemAvailable, normal shrinking resumes.
+        let caught_up_balloon = ceiling - target;
+        let caught_up_avail = mem_total - caught_up_balloon - 300 * MIB;
+        assert_eq!(
+            next_memory_target(200 * MIB, mem_total, caught_up_avail, Some(caught_up_balloon), ceiling, target),
+            Some(target - 256 * MIB),
+        );
+    }
+
+    /// An older agent that omits `Balloon` still reports `MemTotal` and
+    /// `MemAvailable`. Even when zone reserves and uncharged kernel memory
+    /// exceed `MEMORY_HEADROOM`, the balloon must not shrink past
+    /// `MEMORY_HEADROOM` of `MemAvailable` or undo a pressure growth.
+    #[test]
+    fn missing_balloon_reading_preserves_mem_available_headroom() {
+        let ceiling = 24 * GIB;
+        let mem_total: u64 = 24_656_160 * 1024;
+        let used = 200 * MIB;
+        let unavailable = used + 268 * MIB;
+        let mut target = ceiling;
+        loop {
+            let balloon = ceiling - target;
+            let mem_available = mem_total.saturating_sub(balloon).saturating_sub(unavailable);
+            let Some(next) = next_memory_target(used, mem_total, mem_available, None, ceiling, target) else {
+                break;
+            };
+            target = next;
+        }
+        let mem_available = mem_total.saturating_sub(ceiling - target).saturating_sub(unavailable);
+        assert!(mem_available >= MEMORY_HEADROOM, "MemAvailable settled at {} MiB", mem_available / MIB);
+        assert!(mem_available < MEMORY_HEADROOM + 64 * MIB, "kept too much headroom: {} MiB", mem_available / MIB);
+        // After a pressure growth with MemAvailable still at 0, do not shrink.
+        assert_eq!(next_memory_target(used, mem_total, 0, None, ceiling, target + MEMORY_GROW), None);
+    }
+
+    /// A ceiling below MEMORY_FLOOR (e.g. a small KIRI_MEMORY_MIB) must clamp
+    /// cleanly instead of panicking in `u64::clamp`.
+    #[test]
+    fn ceiling_below_floor_does_not_panic() {
+        let small_ceiling = 128 * MIB;
+        let small_total = 120 * MIB;
+        assert_eq!(next_memory_target(32 * MIB, small_total, 64 * MIB, Some(0), small_ceiling, small_ceiling), None);
+        assert_eq!(next_memory_target(32 * MIB, small_total, 64 * MIB, None, small_ceiling, 0), Some(small_ceiling));
+        assert_eq!(next_memory_target(0, 0, 0, None, 0, 0), None);
     }
 }
 
