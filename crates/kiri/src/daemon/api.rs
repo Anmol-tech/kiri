@@ -1940,7 +1940,7 @@ fn command(entry: Option<Vec<String>>, cmd: Option<Vec<String>>, image_entry: &[
     })
 }
 
-/// The primary network when NetworkMode is empty or `default`: the first
+/// The primary network when NetworkMode is empty, `default` or `bridge`: the first
 /// resolved endpoint's name, unless bridge is listed. No match keeps bridge.
 /// Unknown endpoints are left for create to reject. `keys` come from the
 /// request's JSON map, so they are sorted and "first" is the same every time.
@@ -2097,8 +2097,11 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
     if let super::seccomp::Choice::Profile(json) = super::seccomp::choice(&strings(&host["SecurityOpt"]).unwrap_or_default()).map_err(Error::BadRequest)? {
         super::seccomp::compile(json, profile_caps(caps_from(host)?, host["Privileged"].as_bool().unwrap_or(false))).map_err(Error::BadRequest)?;
     }
+    // NetworkMode `bridge` too: Docker joins only the endpoints' networks
+    // when there are any, whatever the mode names (k3d sends `bridge` with
+    // its cluster network, #727), unless they list bridge.
     let network_mode = match host["NetworkMode"].as_str().unwrap_or("default") {
-        "" | "default" => body["NetworkingConfig"]["EndpointsConfig"].as_object()
+        "" | "default" | "bridge" => body["NetworkingConfig"]["EndpointsConfig"].as_object()
             .and_then(|eps| endpoints_primary(eps.keys().map(String::as_str), |key| engine.lock_net().find(key).map(|n| (n.name.clone(), n.internal))))
             .unwrap_or_else(|| "bridge".to_owned()),
         m => m.to_owned(),
