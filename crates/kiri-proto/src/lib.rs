@@ -921,9 +921,9 @@ impl Msg<'_> {
                 for v in [st.uptime_ns, st.mem_total_kib, st.mem_available_kib, st.agent_rss_kib, st.mem_used_kib, st.mem_stall, st.oom_kills] {
                     put_u64(o, v);
                 }
-                if let Some(b) = st.mem_balloon_kib {
-                    put_u64(o, b);
-                }
+                // Always emit the 8th word (u64::MAX for None) so any future
+                // trailing fields stay at fixed offsets.
+                put_u64(o, st.mem_balloon_kib.unwrap_or(u64::MAX));
             }),
             Msg::LayerQuery(d) => frame(out, kind::LAYER_QUERY, |o| put_str(o, d)),
             Msg::LayerStatus(have) => frame(out, kind::LAYER_STATUS, |o| o.push(have as u8)),
@@ -1233,7 +1233,12 @@ pub fn decode(frame: &[u8]) -> Result<Msg<'_>, DecodeError> {
             mem_used_kib: if r.remaining() >= 8 { r.u64()? } else { 0 },
             mem_stall: if r.remaining() >= 8 { r.u64()? } else { 0 },
             oom_kills: if r.remaining() >= 8 { r.u64()? } else { 0 },
-            mem_balloon_kib: if r.remaining() >= 8 { Some(r.u64()?) } else { None },
+            mem_balloon_kib: if r.remaining() >= 8 {
+                let v = r.u64()?;
+                (v != u64::MAX).then_some(v)
+            } else {
+                None
+            },
         }),
         kind::LAYER_QUERY => Msg::LayerQuery(r.str()?),
         kind::LAYER_STATUS => Msg::LayerStatus(r.u8()? != 0),
@@ -1454,6 +1459,28 @@ mod tests {
         round(Msg::InputConsumed { id: "c1", bytes: 65_536 });
         round(Msg::Publish(Publish { id: "c1", udp: true, host_ip: [0, 0, 0, 0], host_port: 8080, to_ip: [172, 17, 0, 2], to_port: 80 }));
         round(Msg::Unpublish { id: "c1" });
+    }
+
+    #[test]
+    fn stats_none_balloon_keeps_wire_offset() {
+        let base = Stats { uptime_ns: 5, mem_total_kib: 6, mem_available_kib: 7, agent_rss_kib: 8, mem_used_kib: 9, mem_stall: 10, oom_kills: 1, mem_balloon_kib: Some(4096) };
+        let absent = Stats { mem_balloon_kib: None, ..base };
+        let mut with_balloon = Vec::new();
+        let mut without_balloon = Vec::new();
+        Msg::Stats(base).encode(&mut with_balloon);
+        Msg::Stats(absent).encode(&mut without_balloon);
+        assert_eq!(without_balloon.len(), with_balloon.len());
+        // Appending a future 9th word must not be decoded into mem_balloon_kib.
+        let mut extended = without_balloon.clone();
+        extended.extend_from_slice(&42u64.to_le_bytes());
+        let len = (extended.len() - 4) as u32;
+        extended[..4].copy_from_slice(&len.to_le_bytes());
+        assert_eq!(decode(&extended).unwrap(), Msg::Stats(absent));
+        // An older 7-word agent omitting the 8th word still decodes as None.
+        let mut old = without_balloon[..without_balloon.len() - 8].to_vec();
+        let len = (old.len() - 4) as u32;
+        old[..4].copy_from_slice(&len.to_le_bytes());
+        assert_eq!(decode(&old).unwrap(), Msg::Stats(absent));
     }
 
     #[test]
