@@ -79,6 +79,116 @@ fn next_memory_target(
     (next.abs_diff(target) >= MEMORY_DEADBAND).then_some(next)
 }
 
+/// How much memory the guest holds, in bytes, from a `Stats` sample.
+fn estimate_used(stats: &kiri_proto::Stats, ceiling: u64, target: u64, host_rss: u64) -> u64 {
+    if stats.mem_used_kib > 0 {
+        // The agent's count: anonymous, shared and kernel memory from the
+        // cgroup, which neither the page cache nor the balloon's own pages
+        // get into.
+        stats.mem_used_kib.saturating_mul(1024).saturating_add(host_rss)
+    } else {
+        // An agent from before that count: MemTotal minus MemAvailable, with
+        // the balloon taken back out. Apple's balloon offers deflate-on-OOM,
+        // so Linux counts its pages as used rather than shrinking MemTotal.
+        // Without a live balloon reading, the balloon is guessed at
+        // ceiling - target, which it only is once the guest has caught up.
+        let apparent = stats.mem_total_kib.saturating_sub(stats.mem_available_kib).saturating_mul(1024);
+        let balloon = stats.mem_balloon_kib.map_or_else(|| ceiling.saturating_sub(target), |k| k.saturating_mul(1024));
+        apparent.saturating_sub(balloon)
+    }
+}
+
+const FALLBACK_SHRINK_SETTLE_TICKS: u8 = 5;
+
+enum PendingFallback {
+    /// Waiting for an in-flight grow to show up in `MemAvailable` before the
+    /// legacy (`mem_used_kib == 0`, no `mem_balloon_kib`) fallback may grow
+    /// again.
+    Grow { avail: u64, peak: u64 },
+    /// Waiting for an in-flight shrink to show up in `MemAvailable` before the
+    /// legacy fallback may shrink again.
+    Shrink { avail: u64, expected_avail: u64, ticks: u8 },
+}
+
+#[derive(Default)]
+struct BalloonState {
+    last_target: Option<u64>,
+    pending: Option<PendingFallback>,
+}
+
+impl BalloonState {
+    fn reset(&mut self) {
+        self.last_target = None;
+        self.pending = None;
+    }
+
+    fn next_target(&mut self, stats: &kiri_proto::Stats, used: u64, ceiling: u64, target: u64) -> Option<u64> {
+        let mem_total = stats.mem_total_kib.saturating_mul(1024);
+        let mem_available = stats.mem_available_kib.saturating_mul(1024);
+        let balloon = stats.mem_balloon_kib.map(|k| k.saturating_mul(1024));
+        let legacy_fallback = stats.mem_used_kib == 0 && balloon.is_none() && mem_total > 0;
+
+        if !legacy_fallback {
+            self.pending = None;
+            let next = next_memory_target(used, mem_total, mem_available, balloon, ceiling, target);
+            self.last_target = Some(next.unwrap_or(target));
+            return next;
+        }
+
+        // An external grow (e.g. `grow_memory()` on pressure) raised `target`
+        // since the last poll: wait for deflation to show up in `MemAvailable`
+        // before allowing the target-derived fallback to grow again.
+        if self.last_target.is_some_and(|prev| target > prev) {
+            self.pending = Some(PendingFallback::Grow { avail: mem_available, peak: mem_available });
+        }
+
+        match self.pending {
+            Some(PendingFallback::Grow { avail, mut peak }) => {
+                if mem_available > peak {
+                    peak = mem_available;
+                }
+                let recovered = mem_available >= MEMORY_HEADROOM
+                    || (peak >= avail.saturating_add(MEMORY_DEADBAND)
+                        && mem_available.saturating_add(MEMORY_DEADBAND) <= peak);
+                self.pending = (!recovered).then_some(PendingFallback::Grow { avail, peak });
+            }
+            Some(PendingFallback::Shrink { avail, expected_avail, ticks }) => {
+                let settled = mem_available < MEMORY_HEADROOM
+                    || mem_available <= expected_avail.saturating_add(MEMORY_DEADBAND)
+                    || mem_available >= avail.saturating_add(MEMORY_DEADBAND)
+                    || ticks >= FALLBACK_SHRINK_SETTLE_TICKS;
+                self.pending = (!settled).then_some(PendingFallback::Shrink {
+                    avail,
+                    expected_avail,
+                    ticks: ticks.saturating_add(1),
+                });
+            }
+            None => {}
+        }
+
+        let next = next_memory_target(used, mem_total, mem_available, None, ceiling, target);
+        let next = match (next, &self.pending) {
+            (Some(n), Some(PendingFallback::Grow { .. })) if n > target => None,
+            (Some(n), Some(PendingFallback::Shrink { .. })) if n < target => None,
+            (next, _) => next,
+        };
+
+        if let Some(n) = next {
+            self.pending = if n > target {
+                Some(PendingFallback::Grow { avail: mem_available, peak: mem_available })
+            } else {
+                Some(PendingFallback::Shrink {
+                    avail: mem_available,
+                    expected_avail: mem_available.saturating_sub(target.saturating_sub(n)),
+                    ticks: 0,
+                })
+            };
+        }
+        self.last_target = Some(next.unwrap_or(target));
+        next
+    }
+}
+
 /// What a request that needs the VM gets while Kiri is stopped (Stop in
 /// the window, the tray or the menu bar): only Start ends that.
 pub const STOPPED: &str = "Kiri is stopped: run `kiri start`, or press Start in the Kiri window, to run containers again";
@@ -2382,45 +2492,25 @@ impl Engine {
         }
         let me = Arc::downgrade(self);
         let _ = std::thread::Builder::new().name("kiri-balloon".into()).spawn(move || {
+            let mut balloon_state = BalloonState::default();
             loop {
                 std::thread::sleep(Duration::from_secs(1));
                 let Some(engine) = me.upgrade() else { return };
-                let Some(vm) = engine.awake() else { continue };
+                let Some(vm) = engine.awake() else {
+                    balloon_state.reset();
+                    continue;
+                };
                 let Ok(stats) = vm.stats() else { continue };
                 let mut target = engine.memory_target.lock().unwrap_or_else(|e| e.into_inner());
                 let ceiling = engine.ceiling();
-                let used = if stats.mem_used_kib > 0 {
-                    // The agent's count: anonymous, shared and kernel memory
-                    // from the cgroup, which neither the page cache nor the
-                    // balloon's own pages get into.
-                    stats.mem_used_kib.saturating_mul(1024).saturating_add(if cfg!(target_os = "macos") { 0 } else { self_rss() })
-                } else {
-                    // An agent from before that count: MemTotal minus
-                    // MemAvailable, with the balloon taken back out. Apple's
-                    // balloon offers deflate-on-OOM, so Linux counts its pages
-                    // as used rather than shrinking MemTotal. The balloon is
-                    // guessed at ceiling - target, which it only is once the
-                    // guest has inflated that far: short of that, the guess
-                    // exceeds the use and the result sits at zero.
-                    let apparent = stats.mem_total_kib.saturating_sub(stats.mem_available_kib).saturating_mul(1024);
-                    let balloon = stats.mem_balloon_kib.map_or_else(|| ceiling.saturating_sub(*target), |k| k.saturating_mul(1024));
-                    apparent.saturating_sub(balloon)
-                };
+                let used = estimate_used(&stats, ceiling, *target, if cfg!(target_os = "macos") { 0 } else { self_rss() });
                 engine.memory_used.store(used, std::sync::atomic::Ordering::Relaxed);
                 engine.memory_stall.store(stats.mem_stall, std::sync::atomic::Ordering::Relaxed);
                 engine.oom_kills.store(stats.oom_kills, std::sync::atomic::Ordering::Relaxed);
                 if !cfg!(target_os = "macos") {
                     continue;
                 }
-                let balloon = stats.mem_balloon_kib.map(|k| k.saturating_mul(1024));
-                if let Some(next) = next_memory_target(
-                    used,
-                    stats.mem_total_kib.saturating_mul(1024),
-                    stats.mem_available_kib.saturating_mul(1024),
-                    balloon,
-                    ceiling,
-                    *target,
-                ) {
+                if let Some(next) = balloon_state.next_target(&stats, used, ceiling, *target) {
                     *target = next;
                     vm.set_memory_target(next);
                 }
@@ -5005,7 +5095,7 @@ mod name_in_use_tests {
 
 #[cfg(test)]
 mod memory_target_tests {
-    use super::{next_memory_target, MEMORY_FLOOR, MEMORY_GROW, MEMORY_HEADROOM};
+    use super::{estimate_used, next_memory_target, BalloonState, MEMORY_FLOOR, MEMORY_GROW, MEMORY_HEADROOM};
 
     const MIB: u64 = 1 << 20;
     const GIB: u64 = 1 << 30;
@@ -5214,6 +5304,82 @@ mod memory_target_tests {
         assert_eq!(next_memory_target(32 * MIB, small_total, 64 * MIB, Some(0), small_ceiling, small_ceiling), None);
         assert_eq!(next_memory_target(32 * MIB, small_total, 64 * MIB, None, small_ceiling, 0), Some(small_ceiling));
         assert_eq!(next_memory_target(0, 0, 0, None, 0, 0), None);
+    }
+
+    /// An older agent reporting neither `mem_used_kib` nor `mem_balloon_kib`
+    /// derives `used` from `ceiling - target`. Under deflation lag (either
+    /// after a fallback grow or after `grow_memory()`), repeated polls with
+    /// `MemAvailable == 0` must not ratchet `target` toward `ceiling`, and
+    /// under shrink lag it must not overshoot downward before inflation lands.
+    #[test]
+    fn legacy_fallback_does_not_ratchet_or_overshoot_under_lag() {
+        let ceiling = 24 * GIB;
+        let mem_total_kib = 24_656_160;
+        let legacy_stats = |mem_available_kib| kiri_proto::Stats {
+            uptime_ns: 0,
+            mem_total_kib,
+            mem_available_kib,
+            agent_rss_kib: 0,
+            mem_used_kib: 0,
+            mem_stall: 0,
+            oom_kills: 0,
+            mem_balloon_kib: None,
+        };
+
+        // 1. Deflation lag after a fallback grow: grows once, then holds while
+        //    MemAvailable stays 0 (or climbs partway during deflation).
+        let mut state = BalloonState::default();
+        let mut target = GIB;
+        let st = legacy_stats(0);
+        let used = estimate_used(&st, ceiling, target, 0);
+        let first = state.next_target(&st, used, ceiling, target);
+        assert_eq!(first, Some(GIB + MEMORY_HEADROOM));
+        target = first.unwrap();
+        for _ in 0..20 {
+            let used = estimate_used(&st, ceiling, target, 0);
+            assert_eq!(state.next_target(&st, used, ceiling, target), None);
+        }
+        // Partial deflation still below headroom does not double-grow.
+        let partial = legacy_stats(128 * 1024);
+        let used = estimate_used(&partial, ceiling, target, 0);
+        assert_eq!(state.next_target(&partial, used, ceiling, target), None);
+        // Once deflation restores ample headroom, normal shrinking resumes.
+        let recovered = legacy_stats(512 * 1024);
+        let used = estimate_used(&recovered, ceiling, target, 0);
+        assert_eq!(state.next_target(&recovered, used, ceiling, target), Some(target - 256 * MIB));
+
+        // 2. Deflation lag right after an external `grow_memory()` bump:
+        //    zero additional fallback grows while MemAvailable remains 0.
+        let mut state = BalloonState::default();
+        let settled = legacy_stats(MEMORY_HEADROOM / 1024);
+        let used = estimate_used(&settled, ceiling, GIB, 0);
+        assert_eq!(state.next_target(&settled, used, ceiling, GIB), None);
+        let grown = GIB + MEMORY_GROW;
+        for _ in 0..10 {
+            let used = estimate_used(&st, ceiling, grown, 0);
+            assert_eq!(state.next_target(&st, used, ceiling, grown), None);
+        }
+
+        // 3. Shrink lag: balloon has not inflated yet after a 256 MiB step,
+        //    so MemAvailable stays at 512 MiB. Must hold until inflation lands
+        //    instead of stepping past equilibrium into MemAvailable == 0.
+        let mut state = BalloonState::default();
+        let reserved = ceiling - mem_total_kib * 1024;
+        let unavailable = 300 * MIB;
+        let eq_target = reserved + unavailable + MEMORY_HEADROOM;
+        let start = eq_target + 256 * MIB;
+        let high_avail = legacy_stats((512 * MIB) / 1024);
+        let used = estimate_used(&high_avail, ceiling, start, 0);
+        let shrunk = state.next_target(&high_avail, used, ceiling, start);
+        assert_eq!(shrunk, Some(eq_target));
+        // Two lagging polls before the balloon finishes inflating: no overshoot.
+        for _ in 0..2 {
+            let used = estimate_used(&high_avail, ceiling, eq_target, 0);
+            assert_eq!(state.next_target(&high_avail, used, ceiling, eq_target), None);
+        }
+        // Once inflation catches up, MemAvailable settles at MEMORY_HEADROOM.
+        let used = estimate_used(&settled, ceiling, eq_target, 0);
+        assert_eq!(state.next_target(&settled, used, ceiling, eq_target), None);
     }
 }
 
