@@ -465,18 +465,49 @@ fn dial_host() -> io::Result<File> {
     Err(io::Error::new(last.kind(), format!("dial host: {last}")))
 }
 
-/// MemTotal and MemAvailable in KiB.
-fn meminfo() -> (u64, u64) {
-    let mut buf = [0u8; 2048];
-    let Ok(n) = File::open("/proc/meminfo").and_then(|mut f| f.read(&mut buf)) else { return (0, 0) };
-    let s = std::str::from_utf8(&buf[..n]).unwrap_or_default();
+/// MemTotal, MemAvailable and (when the kernel reports it) Balloon in KiB.
+fn meminfo_full() -> (u64, u64, Option<u64>) {
+    let Ok(s) = std::fs::read_to_string("/proc/meminfo") else { return (0, 0, None) };
+    let (total, avail, balloon) = parse_meminfo(&s);
+    // Older kernels without `Balloon:` in /proc/meminfo still expose
+    // balloon_inflate / balloon_deflate in /proc/vmstat inside the VM.
+    let balloon = balloon.or_else(|| (std::process::id() == 1).then(vmstat_balloon_kib).flatten());
+    (total, avail, balloon)
+}
+
+fn parse_meminfo(s: &str) -> (u64, u64, Option<u64>) {
     let field = |name: &str| {
         s.lines()
             .find_map(|l| l.strip_prefix(name))
             .and_then(|rest| rest.trim().trim_end_matches("kB").trim().parse().ok())
-            .unwrap_or(0)
     };
-    (field("MemTotal:"), field("MemAvailable:"))
+    (field("MemTotal:").unwrap_or(0), field("MemAvailable:").unwrap_or(0), field("Balloon:"))
+}
+
+fn vmstat_balloon_kib() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/vmstat").ok()?;
+    // SAFETY: sysconf takes no pointers.
+    let page_kib = (unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u64) >> 10;
+    parse_vmstat_balloon_kib(&s, page_kib)
+}
+
+fn parse_vmstat_balloon_kib(s: &str, page_kib: u64) -> Option<u64> {
+    let mut inflate = None;
+    let mut deflate = None;
+    for line in s.lines() {
+        if let Some(v) = line.strip_prefix("balloon_inflate ") {
+            inflate = v.trim().parse::<u64>().ok();
+        } else if let Some(v) = line.strip_prefix("balloon_deflate ") {
+            deflate = v.trim().parse::<u64>().ok();
+        }
+    }
+    Some(inflate?.saturating_sub(deflate?).saturating_mul(page_kib))
+}
+
+/// MemTotal and MemAvailable in KiB.
+fn meminfo() -> (u64, u64) {
+    let (total, avail, _) = meminfo_full();
+    (total, avail)
 }
 
 fn power_off() -> ! {
@@ -537,5 +568,26 @@ mod take_over_tests {
         let text = std::fs::read_to_string(root.join("agent.lock")).unwrap();
         assert_eq!(text.trim(), std::process::id().to_string());
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod meminfo_tests {
+    #[test]
+    fn meminfo_reads_balloon_when_present() {
+        let with = "MemTotal:       24656160 kB\nMemFree:        24297640 kB\nMemAvailable:   24122580 kB\nBalloon:          262144 kB\n";
+        assert_eq!(super::parse_meminfo(with), (24_656_160, 24_122_580, Some(262_144)));
+        let zero = "MemTotal:       8211244 kB\nMemAvailable:   8000000 kB\nBalloon:              0 kB\n";
+        assert_eq!(super::parse_meminfo(zero), (8_211_244, 8_000_000, Some(0)));
+        let without = "MemTotal:       8211244 kB\nMemAvailable:   8000000 kB\n";
+        assert_eq!(super::parse_meminfo(without), (8_211_244, 8_000_000, None));
+    }
+
+    #[test]
+    fn vmstat_balloon_fallback_computes_net_kib() {
+        let vmstat = "nr_free_pages 100\nballoon_inflate 262144\nballoon_deflate 65536\n";
+        assert_eq!(super::parse_vmstat_balloon_kib(vmstat, 4), Some(196_608 * 4));
+        assert_eq!(super::parse_vmstat_balloon_kib("balloon_inflate 10\nballoon_deflate 20\n", 4), Some(0));
+        assert_eq!(super::parse_vmstat_balloon_kib("nr_free_pages 100\n", 4), None);
     }
 }

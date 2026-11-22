@@ -12,7 +12,7 @@ use kiri_proto::{Exited, MAX_OUTPUT_CHUNK, Msg, Stats, Stream};
 
 use super::container::{self, NetCtx, Paths, Process, Root};
 use super::net::{self, Bridges, Dhcp};
-use super::{fsnotify, layers, meminfo, sys};
+use super::{fsnotify, layers, meminfo_full, sys};
 
 /// Input held for a process that is not reading yet. The host sends at most
 /// `INPUT_WINDOW` bytes beyond what `InputConsumed` acknowledged, so a
@@ -413,11 +413,20 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                     return Ok(());
                 }
                 Ok(Msg::StatsRequest) => {
-                    let (mem_total_kib, mem_available_kib) = meminfo();
+                    let (mem_total_kib, mem_available_kib, mem_balloon_kib) = meminfo_full();
                     let agent_rss_kib = self_rss_kib();
                     let (mem_stall, oom_kills) = super::cgroup::memory_trouble();
-                    Msg::Stats(Stats { uptime_ns: sys::boottime_ns(), mem_total_kib, mem_available_kib, agent_rss_kib, mem_used_kib: held_kib(paths, agent_rss_kib), mem_stall, oom_kills })
-                        .encode(&mut out)
+                    Msg::Stats(Stats {
+                        uptime_ns: sys::boottime_ns(),
+                        mem_total_kib,
+                        mem_available_kib,
+                        agent_rss_kib,
+                        mem_used_kib: held_kib(paths, agent_rss_kib),
+                        mem_stall,
+                        oom_kills,
+                        mem_balloon_kib,
+                    })
+                    .encode(&mut out)
                 }
                 Ok(Msg::LayerQuery(digest)) => Msg::LayerStatus(layers::present(&paths.layers, digest)).encode(&mut out),
                 // The blob follows the frame on the same stream.

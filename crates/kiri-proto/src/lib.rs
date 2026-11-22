@@ -352,6 +352,9 @@ pub struct Stats {
     pub mem_stall: u64,
     /// Processes the kernel has killed for memory since boot (/proc/vmstat oom_kill).
     pub oom_kills: u64,
+    /// Pages held by the memory balloon, in KiB. None from an agent or
+    /// kernel that does not report it.
+    pub mem_balloon_kib: Option<u64>,
 }
 
 /// What the guest knows about its own boot, in nanoseconds of CLOCK_BOOTTIME.
@@ -918,6 +921,9 @@ impl Msg<'_> {
                 for v in [st.uptime_ns, st.mem_total_kib, st.mem_available_kib, st.agent_rss_kib, st.mem_used_kib, st.mem_stall, st.oom_kills] {
                     put_u64(o, v);
                 }
+                if let Some(b) = st.mem_balloon_kib {
+                    put_u64(o, b);
+                }
             }),
             Msg::LayerQuery(d) => frame(out, kind::LAYER_QUERY, |o| put_str(o, d)),
             Msg::LayerStatus(have) => frame(out, kind::LAYER_STATUS, |o| o.push(have as u8)),
@@ -1227,6 +1233,7 @@ pub fn decode(frame: &[u8]) -> Result<Msg<'_>, DecodeError> {
             mem_used_kib: if r.remaining() >= 8 { r.u64()? } else { 0 },
             mem_stall: if r.remaining() >= 8 { r.u64()? } else { 0 },
             oom_kills: if r.remaining() >= 8 { r.u64()? } else { 0 },
+            mem_balloon_kib: if r.remaining() >= 8 { Some(r.u64()?) } else { None },
         }),
         kind::LAYER_QUERY => Msg::LayerQuery(r.str()?),
         kind::LAYER_STATUS => Msg::LayerStatus(r.u8()? != 0),
@@ -1400,14 +1407,18 @@ mod tests {
         round(Msg::Shutdown);
         round(Msg::Error("boom"));
         round(Msg::StatsRequest);
-        let full = Stats { uptime_ns: 5, mem_total_kib: 6, mem_available_kib: 7, agent_rss_kib: 8, mem_used_kib: 9, mem_stall: 9173, oom_kills: 2 };
+        let full = Stats { uptime_ns: 5, mem_total_kib: 6, mem_available_kib: 7, agent_rss_kib: 8, mem_used_kib: 9, mem_stall: 9173, oom_kills: 2, mem_balloon_kib: Some(4096) };
         round(Msg::Stats(full));
+        round(Msg::Stats(Stats { mem_balloon_kib: Some(0), ..full }));
+        round(Msg::Stats(Stats { mem_balloon_kib: None, ..full }));
         // Older agents' Stats, without the later words, still decode.
         let mut buf = Vec::new();
         Msg::Stats(full).encode(&mut buf);
-        let no_memory_words = Stats { mem_stall: 0, oom_kills: 0, ..full };
-        assert_eq!(decode(&buf[..buf.len() - 16]).unwrap(), Msg::Stats(no_memory_words));
-        assert_eq!(decode(&buf[..buf.len() - 24]).unwrap(), Msg::Stats(Stats { mem_used_kib: 0, ..no_memory_words }));
+        let no_balloon = Stats { mem_balloon_kib: None, ..full };
+        assert_eq!(decode(&buf[..buf.len() - 8]).unwrap(), Msg::Stats(no_balloon));
+        let no_memory_words = Stats { mem_stall: 0, oom_kills: 0, ..no_balloon };
+        assert_eq!(decode(&buf[..buf.len() - 24]).unwrap(), Msg::Stats(no_memory_words));
+        assert_eq!(decode(&buf[..buf.len() - 32]).unwrap(), Msg::Stats(Stats { mem_used_kib: 0, ..no_memory_words }));
         round(Msg::LayerQuery("sha256:ab"));
         round(Msg::LayerStatus(true));
         round(Msg::LayerBegin(LayerBegin { digest: "sha256:ab", media_type: "x+gzip", size: 9 }));
